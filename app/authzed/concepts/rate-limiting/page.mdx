@@ -1,0 +1,720 @@
+import { Callout } from "nextra/components";
+
+# Rate Limiting in AuthZed Dedicated
+
+## Overview
+
+AuthZed Dedicated implements distributed rate limiting using the GCRA (Generic Cell Rate Algorithm) with gossip-based coordination across replicas. This protects your Permissions System from being overwhelmed by any single client or application.
+
+<Callout type="info">
+This feature is available in **AuthZed Dedicated** only. OSS SpiceDB provides different resource management mechanisms including dispatch concurrency limits, memory protection middleware, and connection pool limits.
+</Callout>
+
+## Architecture
+
+```text
+                     ┌──────────────┐
+                     │   Client     │
+                     └──────┬───────┘
+                            │
+                            ↓
+                ┌────────────────────────┐
+                │  Envoy/Contour         │
+                │  (HTTP headers)        │
+                └────────┬───────────────┘
+                         │
+                         ↓
+        ┌────────────────────────────────────────┐
+        │  AuthZed Dedicated SpiceDB             │
+        │  ┌──────────────────────────────────┐  │
+        │  │  Rate Limit Extender (gRPC hook) │  │
+        │  │  • Matches rate limit rules      │  │
+        │  │  • GCRA rate limiting            │  │
+        │  │  • Generates bucket keys         │  │
+        │  └─────────┬────────────────────────┘  │
+        │            │                            │
+        │   ┌────────┴───────┐                   │
+        │   │  Gossip Store  │                   │
+        │   │  (TAT values)  │                   │
+        │   └────────┬───────┘                   │
+        │            │                            │
+        │   ┌────────┴───────┐                   │
+        │   │ QUIC Gossiper  │←─────────┐        │
+        │   └────────────────┘          │        │
+        └───────────────────────────────┼────────┘
+                                        │
+                     Gossip Protocol ───┘
+                     (TAT coordination)
+```
+
+## Implementation Details
+
+### GCRA (Generic Cell Rate Algorithm)
+
+GCRA is a token bucket variant that tracks the **Theoretical Arrival Time (TAT)** - the time when the next request can be allowed.
+
+- **Per-node rate**: `global_rate / replicas`
+- **Burst**: Up to `global_rate` (full limit)
+- **TAT calculation**: `max(now, prev_TAT) + T` where `T = 1/rate`
+
+### Distributed Coordination
+
+**Coordinated Mode** (gossip healthy):
+
+- Each node gets `1/N` of the rate limit
+- Burst allows up to the full limit
+- TAT updates are gossiped to all peers
+- Peers use `max(local_TAT, remote_TAT * scaling_factor)` to converge
+
+**Safe Mode** (gossip unhealthy):
+
+- Each node gets `1/N²` of the rate limit (conservative to prevent over-admission)
+- Burst reduced to `1/N` of full limit per node
+- Total capacity across N nodes: `N * (1/N²) = 1/N` of configured limit
+- Conservative approach prevents over-admission during network partition
+- Example: 9000 RPS global limit, 3 nodes → Each node allows 1000 RPS in safe mode (total: 3000 RPS system-wide)
+- Automatically recovers to full rate when gossip connectivity is restored
+
+**Scaling Factor**: TAT values are scaled by `1/N` when gossiped to convert per-replica TAT to global TAT.
+
+### Peer Discovery
+
+Uses Kubernetes EndpointSlice watching:
+
+- Automatically discovers SpiceDB pods
+- Updates peer list on scale events
+- Connects via QUIC with mutual TLS
+
+## Configuration
+
+### CLI Flags
+
+```bash
+# Basic setup
+--rate-limit-config /path/to/fgam.yaml
+--rate-limit-gossip-enabled
+
+# Gossip configuration (typically auto-configured by operator)
+--rate-limit-gossip-listen-addr :6000
+--rate-limit-gossip-target-service spicedb
+--rate-limit-gossip-replicas 3
+```
+
+### FGAM Configuration
+
+Rate limits are defined in the same FGAM YAML file as other features.
+
+#### Basic Examples
+
+```yaml
+rate_limits:
+  # Global rate limit
+  - id: "global-limit"
+    displayName: "Global API Limit"
+    match:
+      all: true
+    limit:
+      unit: "second"
+      requests_per_unit: 1000
+
+  # Per-endpoint
+  - id: "check-limit"
+    displayName: "Check Operations"
+    match:
+      endpoint: ["CheckPermission"]
+    limit:
+      unit: "second"
+      requests_per_unit: 500
+
+  # Multiple endpoints (OR logic)
+  - id: "read-ops"
+    displayName: "Read Operations"
+    match:
+      endpoint:
+        - "CheckPermission"
+        - "ReadRelationships"
+        - "LookupResources"
+    limit:
+      unit: "second"
+      requests_per_unit: 1000
+```
+
+#### Per-Service-Account Limits
+
+```yaml
+rate_limits:
+  - id: "service-account-limit"
+    displayName: "Per Service Account Limit"
+    match:
+      service_account:
+        - "mobile-app"
+        - "web-app"
+        - "batch-processor"
+    bucket_by:
+      service_account: true
+    limit:
+      unit: "minute"
+      requests_per_unit: 10000
+```
+
+#### Header-Based Limits
+
+```yaml
+rate_limits:
+  # Match by header presence/value
+  - id: "premium-tier"
+    displayName: "Premium Tier Limit"
+    match:
+      header:
+        - name: "x-tier"
+          value: "premium"
+    bucket_by:
+      request: 'meta.get("x-tenant-id", "default")'
+    limit:
+      unit: "second"
+      requests_per_unit: 2000
+
+  # Match any of multiple headers (OR logic)
+  - id: "enterprise-users"
+    displayName: "Enterprise Users"
+    match:
+      header:
+        - name: "x-tier"
+          value: "enterprise"
+        - name: "x-premium"
+          value: "true"
+        - name: "x-enterprise"  # Any value
+    limit:
+      unit: "second"
+      requests_per_unit: 5000
+```
+
+#### CEL Expressions
+
+CEL expressions have access to:
+
+- `endpoint` - API method name
+- `serviceAccount` - Service account ID
+- `meta` or `headers` - gRPC metadata (map[string]string, both names are aliases for the same data)
+  - Use `meta.get("key", "default")` or `headers.get("key", "default")` for safe access
+  - Header keys are automatically lowercased in gRPC metadata
+- Request proto fields (e.g., `CheckPermissionRequest.permission`)
+
+```yaml
+rate_limits:
+  # Complex matching
+  - id: "complex-match"
+    displayName: "Complex Matching"
+    match:
+      request: |
+        (endpoint in ["CheckPermission", "ReadRelationships"]) &&
+        (meta.get("x-tier", "") in ["premium", "enterprise"]) &&
+        serviceAccount.startsWith("prod-")
+    limit:
+      unit: "second"
+      requests_per_unit: 3000
+
+  # Per-document rate limit
+  - id: "document-checks"
+    displayName: "Per Document Checks"
+    match:
+      endpoint: ["CheckPermission"]
+      request: 'CheckPermissionRequest.resource.object_type == "document"'
+    bucket_by:
+      request: "CheckPermissionRequest.resource.object_id"
+    limit:
+      unit: "second"
+      requests_per_unit: 10
+
+  # Combined bucketing
+  - id: "tenant-endpoint-limit"
+    displayName: "Per-Tenant Per-Endpoint"
+    match:
+      all: true
+    bucket_by:
+      request: 'endpoint + "/" + meta.get("x-tenant-id", "default")'
+    limit:
+      unit: "minute"
+      requests_per_unit: 5000
+```
+
+#### Multi-Criteria Matching (AND Logic)
+
+All fields in a single `match` block use AND logic:
+
+```yaml
+rate_limits:
+  # Endpoint AND role AND header (all must match)
+  - id: "admin-writes"
+    displayName: "Admin Write Operations"
+    match:
+      endpoint:
+        - "WriteRelationships"
+        - "DeleteRelationships"
+      role: ["admin"]
+      header:
+        - name: "x-audit"
+          value: "enabled"
+    limit:
+      unit: "minute"
+      requests_per_unit: 1000
+```
+
+### Time Units
+
+Supported units: `second`, `minute`, `hour`
+
+```yaml
+limit:
+  unit: "second"
+  requests_per_unit: 100  # 100 requests per second
+
+limit:
+  unit: "minute"
+  requests_per_unit: 6000  # 100 requests per second (6000/60)
+
+limit:
+  unit: "hour"
+  requests_per_unit: 360000  # 100 requests per second (360000/3600)
+```
+
+## Error Handling
+
+### Error Response
+
+When a rate limit is exceeded:
+
+```text
+gRPC Status Code: RESOURCE_EXHAUSTED (8)
+Message: "rate limit exceeded"
+
+Trailers:
+  x-ratelimit-id: "check-limit"
+  x-ratelimit-key: "CheckPermission/tenant-abc"
+  retry-after: "1.234"  # Seconds
+```
+
+### HTTP Headers (via Envoy)
+
+Envoy/Contour adds standard rate limit headers:
+
+```text
+X-RateLimit-Limit: 1000
+X-RateLimit-Remaining: 245
+X-RateLimit-Reset: 42  # Seconds until reset
+```
+
+### Client Implementation
+
+#### Go
+
+```go
+import (
+    "context"
+    "fmt"
+    "strconv"
+    "time"
+
+    v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
+    "google.golang.org/grpc"
+    "google.golang.org/grpc/codes"
+    "google.golang.org/grpc/metadata"
+    "google.golang.org/grpc/status"
+)
+
+func checkWithRetry(ctx context.Context, client v1.PermissionsServiceClient, req *v1.CheckPermissionRequest) error {
+    maxRetries := 5
+    for attempt := 0; attempt < maxRetries; attempt++ {
+        var trailer metadata.MD
+        resp, err := client.CheckPermission(ctx, req, grpc.Trailer(&trailer))
+        if err == nil {
+            return nil
+        }
+
+        if status.Code(err) == codes.ResourceExhausted {
+            // Extract retry-after from trailers
+            if retryAfter := trailer.Get("retry-after"); len(retryAfter) > 0 {
+                if seconds, err := strconv.ParseFloat(retryAfter[0], 64); err == nil {
+                    time.Sleep(time.Duration(seconds * float64(time.Second)))
+                    continue
+                }
+            }
+            // Fallback to exponential backoff
+            time.Sleep(time.Duration(100*(1<<attempt)) * time.Millisecond)
+            continue
+        }
+
+        return err
+    }
+    return fmt.Errorf("max retries exceeded")
+}
+```
+
+#### Python
+
+```python
+import grpc
+import time
+
+def check_with_retry(client, request, max_retries=5):
+    for attempt in range(max_retries):
+        try:
+            return client.CheckPermission(request)
+        except grpc.RpcError as e:
+            if e.code() == grpc.StatusCode.RESOURCE_EXHAUSTED:
+                # Extract retry-after from trailers
+                trailing_metadata = dict(e.trailing_metadata())
+                retry_after = trailing_metadata.get('retry-after')
+
+                if retry_after:
+                    time.sleep(float(retry_after))
+                else:
+                    # Exponential backoff
+                    time.sleep(0.1 * (2 ** attempt))
+                continue
+            raise
+
+    raise Exception("Max retries exceeded")
+```
+
+#### Node.js
+
+```javascript
+const grpc = require('@grpc/grpc-js');
+
+async function checkWithRetry(client, request, maxRetries = 5) {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            return await new Promise((resolve, reject) => {
+                const call = client.checkPermission(request, (err, response) => {
+                    if (err) reject(err);
+                    else resolve(response);
+                });
+            });
+        } catch (err) {
+            if (err.code === grpc.status.RESOURCE_EXHAUSTED) {
+                // Extract retry-after from trailers
+                const retryAfter = err.metadata.get('retry-after');
+                const delay = retryAfter ?
+                    parseFloat(retryAfter[0]) * 1000 :
+                    100 * Math.pow(2, attempt);
+
+                await new Promise(resolve => setTimeout(resolve, delay));
+                continue;
+            }
+            throw err;
+        }
+    }
+    throw new Error('Max retries exceeded');
+}
+```
+
+## Metrics
+
+### Available Metrics
+
+```prometheus
+# Rate limit check latency
+spicedb_ratelimit_check_latency_seconds{rate_limit_id}
+
+# Gossip metrics
+spicedb_ratelimit_gossip_messages_sent_total
+spicedb_ratelimit_gossip_messages_dropped_total
+spicedb_ratelimit_gossip_peers_active
+spicedb_ratelimit_gossip_connection_errors_total
+
+# TAT coordination
+spicedb_ratelimit_gossip_local_updates_total
+spicedb_ratelimit_gossip_remote_updates_applied_total
+spicedb_ratelimit_gossip_remote_updates_ignored_total{reason}
+spicedb_ratelimit_gossip_propagation_latency_seconds
+```
+
+### Monitoring Queries
+
+```prometheus
+# Rate limit rejection rate
+rate(spicedb_ratelimit_check_latency_seconds_count{rate_limit_id="check-limit", result="rejected"}[5m])
+
+# Gossip health (compare to configured --rate-limit-gossip-replicas)
+spicedb_ratelimit_gossip_peers_active
+# Note: Compare this value to your configured replica count
+
+# TAT propagation lag
+histogram_quantile(0.95, rate(spicedb_ratelimit_gossip_propagation_latency_seconds_bucket[5m]))
+
+# Top rejected rate limits
+topk(10, rate(spicedb_ratelimit_check_latency_seconds_count{result="rejected"}[5m]))
+```
+
+### Recommended Alerts
+
+```yaml
+groups:
+  - name: rate_limiting
+    rules:
+      # High rejection rate
+      - alert: HighRateLimitRejections
+        expr: |
+          rate(spicedb_ratelimit_check_latency_seconds_count{result="rejected"}[5m]) > 10
+        for: 5m
+        annotations:
+          summary: "High rate limit rejections"
+          description: "{{ $labels.rate_limit_id }} is rejecting {{ $value }} req/s"
+
+      # Gossip unhealthy (replace '3' with your actual replica count)
+      - alert: RateLimitGossipUnhealthy
+        expr: |
+          spicedb_ratelimit_gossip_peers_active < 3 * 0.8
+        for: 2m
+        annotations:
+          summary: "Rate limit gossip connectivity degraded"
+          description: "Only {{ $value }} peers connected out of expected 3 (safe mode active)"
+
+      # High propagation latency
+      - alert: RateLimitPropagationSlow
+        expr: |
+          histogram_quantile(0.95, rate(spicedb_ratelimit_gossip_propagation_latency_seconds_bucket[5m])) > 1
+        for: 5m
+        annotations:
+          summary: "Slow rate limit TAT propagation"
+          description: "P95 propagation latency is {{ $value }}s"
+```
+
+## Best Practices
+
+### 1. Start Conservative
+
+Begin with generous limits and tighten based on observed usage:
+
+```yaml
+# Initial deployment
+rate_limits:
+  - id: "reads"
+    match:
+      endpoint: ["CheckPermission", "ReadRelationships"]
+    limit:
+      requests_per_unit: 10000  # Generous initial limit
+
+# After monitoring (adjust based on P99)
+rate_limits:
+  - id: "reads"
+    match:
+      endpoint: ["CheckPermission", "ReadRelationships"]
+    limit:
+      requests_per_unit: 5000  # Tightened based on actual usage
+```
+
+### 2. Use Layered Limits
+
+Combine global and per-client limits:
+
+```yaml
+rate_limits:
+  # Global system capacity
+  - id: "global"
+    match:
+      all: true
+    limit:
+      unit: "second"
+      requests_per_unit: 50000
+
+  # Per-tenant limits (must sum to <= global)
+  - id: "tenant-limit"
+    match:
+      all: true
+    bucket_by:
+      request: 'meta.get("x-tenant-id", "default")'
+    limit:
+      unit: "second"
+      requests_per_unit: 5000
+```
+
+### 3. Expensive Operations Get Lower Limits
+
+```yaml
+rate_limits:
+  # Fast operations
+  - id: "checks"
+    match:
+      endpoint: ["CheckPermission"]
+    limit:
+      unit: "second"
+      requests_per_unit: 10000
+
+  # Expensive operations
+  - id: "lookups"
+    match:
+      endpoint: ["LookupSubjects", "LookupResources"]
+    limit:
+      unit: "second"
+      requests_per_unit: 100
+
+  # Bulk operations
+  - id: "bulk"
+    match:
+      endpoint: ["BulkExportRelationships"]
+    limit:
+      unit: "minute"
+      requests_per_unit: 10
+```
+
+### 4. Reserve Capacity for Critical Applications
+
+```yaml
+rate_limits:
+  - id: "production-apps"
+    displayName: "Production Applications"
+    match:
+      header:
+        - name: "x-environment"
+          value: "production"
+    bucket_by:
+      request: 'meta.get("x-app-id", "default")'
+    limit:
+      unit: "second"
+      requests_per_unit: 8000  # 80% of capacity
+
+  - id: "non-production"
+    displayName: "Non-Production"
+    match:
+      header:
+        - name: "x-environment"
+          value: "staging"
+    limit:
+      unit: "second"
+      requests_per_unit: 2000  # 20% of capacity
+```
+
+### 5. Monitor Safe Mode Transitions
+
+Safe mode indicates gossip issues. Monitor and investigate:
+
+```prometheus
+# Check if in safe mode (fewer peers than expected)
+# Replace '3' with your configured --rate-limit-gossip-replicas value
+spicedb_ratelimit_gossip_peers_active < 3
+```
+
+## Troubleshooting
+
+<Callout type="info">
+The troubleshooting examples use `authzed` as the namespace. Replace this with your actual deployment namespace.
+</Callout>
+
+### Issue: Frequent Rate Limit Rejections
+
+**Symptoms:**
+
+- High `spicedb_ratelimit_check_latency_seconds_count{result="rejected"}`
+- Clients receiving many `RESOURCE_EXHAUSTED` errors
+
+**Diagnosis:**
+
+```bash
+# Check which limits are rejecting
+kubectl logs -n authzed deployment/spicedb | grep "rate limit exceeded"
+
+# View rejection metrics by rate limit ID
+curl http://prometheus:9090/api/v1/query?query='rate(spicedb_ratelimit_check_latency_seconds_count{result="rejected"}[5m])'
+```
+
+**Solutions:**
+
+1. Increase limit if legitimate traffic
+2. Investigate traffic spike
+3. Add per-client limits if one client monopolizing
+4. Implement client-side rate limiting
+
+### Issue: Gossip Unhealthy (Safe Mode)
+
+**Symptoms:**
+
+- `spicedb_ratelimit_gossip_peers_active` < expected
+- More aggressive rate limiting than configured
+
+**Diagnosis:**
+
+```bash
+# Check peer connectivity
+kubectl logs -n authzed deployment/spicedb | grep "gossip"
+
+# Check network policies
+kubectl get networkpolicy -n authzed
+
+# Verify gossip port (6000) is open
+kubectl exec -it -n authzed deployment/spicedb -- nc -zv spicedb 6000
+```
+
+**Solutions:**
+
+1. Verify NetworkPolicy allows gossip port (6000)
+2. Check TLS certificates for gossip
+3. Verify service discovery (EndpointSlice)
+4. Check for pod network issues
+
+### Issue: TAT Propagation Slow
+
+**Symptoms:**
+
+- High `spicedb_ratelimit_gossip_propagation_latency_seconds`
+- Inconsistent rate limiting across replicas
+
+**Diagnosis:**
+
+```bash
+# Check propagation latency
+curl http://prometheus:9090/api/v1/query?query='histogram_quantile(0.95, rate(spicedb_ratelimit_gossip_propagation_latency_seconds_bucket[5m]))'
+
+# Check for dropped messages
+kubectl logs -n authzed deployment/spicedb | grep "gossip.*dropped"
+```
+
+**Solutions:**
+
+1. Check network latency between pods
+2. Verify QUIC connectivity
+3. Check for CPU/memory pressure
+4. Increase gossip buffer size if messages being dropped
+
+### Issue: Rate Limits Not Enforced
+
+**Diagnosis:**
+
+```bash
+# Check if rate limit extender is enabled
+kubectl logs -n authzed deployment/spicedb | grep "rate limit extender"
+
+# Verify configuration loaded
+kubectl logs -n authzed deployment/spicedb | grep "loading rate limit configuration"
+
+# Check for configuration errors
+kubectl logs -n authzed deployment/spicedb | grep -i "error.*rate.*limit"
+```
+
+**Solutions:**
+
+1. Verify `--rate-limit-config` flag points to correct file
+2. Check FGAM YAML syntax
+3. Ensure rate limits have valid match criteria
+4. Check that headers are being sent by clients
+
+## Comparison: OSS SpiceDB vs AuthZed Dedicated
+
+| Feature                           | OSS SpiceDB | AuthZed Dedicated      |
+|-----------------------------------|-------------|------------------------|
+| **Per-API-Key Rate Limiting**     | ❌          | ✅                     |
+| **Per-Service-Account Limits**    | ❌          | ✅                     |
+| **Per-Endpoint Limits**           | ❌          | ✅                     |
+| **Custom Header-Based Limits**    | ❌          | ✅                     |
+| **CEL Expression Matching**       | ❌          | ✅                     |
+| **Distributed Coordination**      | ❌          | ✅ (Gossip over QUIC)  |
+| **Rate Limit HTTP Headers**       | ❌          | ✅                     |
+| **Dispatch Concurrency Limits**   | ✅          | ✅                     |
+| **Memory Protection**             | ✅          | ✅                     |
+| **Connection Pool Limits**        | ✅          | ✅                     |
+
+## References
+
+- **GCRA Algorithm**: [Understanding GCRA](https://blog.ian.stapletoncordas.co/2018/12/understanding-generic-cell-rate-limiting)
+- **Envoy Headers**: [IETF Rate Limit Headers](https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers)
