@@ -62,6 +62,14 @@
   }
 }
 
+/* Nextra's own nested rule (html { &:not(:has(:focus)) }) sets
+   scroll-padding-top to the navbar height only and wins on source order at
+   equal specificity; :root lifts this above it so the banner height is
+   included and anchor targets aren't hidden under the sticky chrome. */
+html:root:not(:has(*:focus)) {
+  scroll-padding-top: calc(var(--nextra-banner-height, 0px) + var(--nextra-navbar-height));
+}
+
 body {
   font-feature-settings:
     "rlig" 1,
